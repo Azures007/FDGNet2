@@ -1,11 +1,172 @@
+import torch
+import torch.nn as nn
 from .discrim_hyperG import *
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import torch.fft
 import random
 from math import sqrt
 import numpy as np
+import torch.nn.functional as F
 
+# ==============================================================================
+# Innovation 1: 3D CNN Spatial-Spectral Feature Extraction
+# 创新点1：3D CNN 提取空谱特征
+# ==============================================================================
+class SpatialSpectral3DCNN(nn.Module):
+    def __init__(self, in_channels, out_channels=64, patch_size=13):
+        super(SpatialSpectral3DCNN, self).__init__()
+        # Input shape: (B, C, H, W). We need to reshape it for 3D CNN: (B, 1, C, H, W)
+        # where C acts as the depth dimension.
+        self.conv3d_1 = nn.Conv3d(1, 16, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.bn_1 = nn.BatchNorm3d(16)
+        
+        self.conv3d_2 = nn.Conv3d(16, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.bn_2 = nn.BatchNorm3d(32)
+        
+        # Squeeze depth dimension back to channels
+        self.conv2d = nn.Conv2d(32 * in_channels, out_channels, kernel_size=1)
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # Add channel dimension for 3D CNN: (B, 1, C, H, W)
+        x_3d = x.unsqueeze(1)
+        
+        x_3d = F.relu(self.bn_1(self.conv3d_1(x_3d)))
+        x_3d = F.relu(self.bn_2(self.conv3d_2(x_3d)))
+        
+        # Reshape to 2D: (B, 32 * C, H, W)
+        x_2d = x_3d.view(B, -1, H, W)
+        
+        # Project to desired channel size
+        out = F.relu(self.conv2d(x_2d))
+        return out
 
+# ==============================================================================
+# Innovation 2: FDE-Guided Class Manifold Construction (Frequency Domain Enhancement)
+# 创新点2：FDE-Guided 频域增强 (基于低频振幅的跨域风格迁移 + 相位保留)
+# ==============================================================================
+class FDE_Enhancer(nn.Module):
+    def __init__(self, in_channels, h, w):
+        super(FDE_Enhancer, self).__init__()
+        self.alpha = nn.Parameter(torch.ones(1, in_channels, 1, 1) * 0.5)
+
+    def extract_amp_phase(self, x):
+        # 2D FFT
+        fft_x = torch.fft.fft2(x, norm='ortho')
+        amp = torch.abs(fft_x)
+        phase = torch.angle(fft_x)
+        return amp, phase
+
+    def forward(self, x_src, x_tgt=None):
+        if x_tgt is not None:
+            amp_src, phase_src = self.extract_amp_phase(x_src)
+            amp_tgt, phase_tgt = self.extract_amp_phase(x_tgt)
+            
+            # Mix amplitude from target to source
+            alpha = torch.sigmoid(self.alpha)
+            mixed_amp = (1 - alpha) * amp_src + alpha * amp_tgt
+            
+            # Reconstruct with mixed amplitude and original phase
+            complex_mixed = mixed_amp * torch.exp(1j * phase_src)
+            x_out = torch.fft.ifft2(complex_mixed, norm='ortho').real
+            return x_out
+        else:
+            return x_src
+
+# Innovation 1: 3D FFT for Frequency Domain Disentanglement (filtering spectral + spatial noise)
+# 创新点1：3D FFT 频域解纠缠（过滤光谱 + 空间噪声）
+class SpectralSpatialFFT3D(nn.Module):
+    def __init__(self, h, w, c, mask_ratio=0.01):
+        super().__init__()
+        self.h = h
+        self.w = w
+        self.c = c
+        self.mask_ratio = mask_ratio
+        # Complex weight for frequency domain filtering
+        # 频域滤波的复数权重
+        self.complex_weight = nn.Parameter(torch.randn(c, h, w, 2, dtype=torch.float32) * 0.02)
+
+    def forward(self, x):
+        # x shape: (B, C, H, W)
+        B, C, H, W = x.shape
+        
+        # 3D FFT: Transform spatial (H, W) and spectral (C) dimensions
+        # 3D FFT：变换空间 (H, W) 和光谱 (C) 维度
+        # Treat C as depth. fftn over last 3 dims if input is (B, C, H, W)
+        x_fft = torch.fft.fftn(x, dim=(1, 2, 3), norm='ortho')
+        
+        # Frequency domain filtering / disentanglement
+        # 频域滤波/解纠缠
+        # Apply learnable weight
+        weight = torch.view_as_complex(self.complex_weight)
+        # Resize weight to match x_fft if needed, or assume fixed size
+        if weight.shape != x_fft.shape[1:]:
+             weight = F.interpolate(weight.unsqueeze(0), size=(C, H, W)).squeeze(0)
+             
+        x_fft = x_fft * weight.unsqueeze(0)
+        
+        # Soft thresholding or masking for noise removal (simplified)
+        # 软阈值或掩码用于去噪（简化版）
+        amp = torch.abs(x_fft)
+        threshold = torch.quantile(amp.reshape(B, -1), self.mask_ratio, dim=1, keepdim=True).reshape(B, 1, 1, 1)
+        mask = torch.where(amp > threshold, torch.ones_like(amp), torch.zeros_like(amp))
+        x_fft = x_fft * mask
+        
+        # Inverse 3D FFT
+        # 逆 3D FFT
+        x = torch.fft.ifftn(x_fft, dim=(1, 2, 3), norm='ortho').real
+        return x
+
+# Innovation 2: Lightweight Attention ECA (Enhance useful features)
+# 创新点2：轻量级注意力 ECA（强化有用特征）
+class ECA(nn.Module):
+    def __init__(self, channel, k_size=3):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: (B, C, H, W)
+        # Global Average Pooling
+        # 全局平均池化
+        y = self.avg_pool(x)
+        
+        # 1D Convolution to capture channel interaction
+        # 1D 卷积捕获通道交互
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        
+        # Channel weight
+        # 通道权重
+        y = self.sigmoid(y)
+        
+        # Reweight features
+        # 重加权特征
+        return x * y.expand_as(x)
+
+class FeatureEnhancer(nn.Module):
+    def __init__(self, imsize, imdim, n_channels=64):
+        super(FeatureEnhancer, self).__init__()
+        self.spatial_spectral = SpatialSpectral3DCNN(imdim, imdim)
+        self.fde = FDE_Enhancer(imdim, imsize[0], imsize[1])
+        self.eca = ECA(imdim)
+        
+        self.beta = nn.Parameter(torch.tensor([0.5]))
+
+    def forward(self, x_src, x_tgt=None):
+        # 1. 3D CNN for spatial-spectral local feature extraction
+        x_local = self.spatial_spectral(x_src)
+        
+        # 2. FDE for global amplitude alignment (if target is provided)
+        x_fde = self.fde(x_src, x_tgt)
+        
+        # 3. Channel Attention
+        x_eca = self.eca(x_fde)
+        
+        # 4. Fusion
+        beta = torch.sigmoid(self.beta)
+        out = beta * x_local + (1 - beta) * x_eca
+        return out
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -490,20 +651,25 @@ class Generator(nn.Module):
 
     def forward(self, x):
         if self.freq_dis:
-            # Encoder of Ours
-            B,C,H,W = x.shape
-            x1 = x.view(B, C, -1)
-            x1 = x1.transpose(1,2)
-            x_spa = self.low_freq_spa((x1))
-            x_spec = self.low_freq_spec((x1))
-            x_spa = x_spa.transpose(1,2)
-            x_spa = x_spa.view(B, C, H,W)
-            x_spec = x_spec.transpose(1, 2)
-            x_spec = x_spec.view(B, C, H, W)
-            x = torch.cat((x_spec,x_spa),dim=1)
-            x = self.convFRE(x)
+            # Our Encoder with low-frequency disentanglement
+            B, C, H, W = x.shape
+            x1 = x.view(B, C, -1).transpose(1, 2)
+            
+            x_spa = self.low_freq_spa(x1)
+            x_spec = self.low_freq_spec(x1)
+            
+            x_spa = x_spa.transpose(1, 2).view(B, C, H, W)
+            x_spec = x_spec.transpose(1, 2).view(B, C, H, W)
+            
+            feat = torch.cat((x_spec, x_spa), dim=1)
+            out = self.convFRE(feat)
+            
+            # THE FIX: Need to bound the output to [0,1] just like the else branch!
+            # Otherwise the Discriminator receives unbounded values and destroys training.
+            out = torch.sigmoid(out)
+            return out
         else:
-            # Encoder of SDGNet
+            # SDGNet's default Encoder
             x_morph= self.Morphology(x)
             z = torch.randn(len(x), self.zdim).to(self.device)
             x_morph = self.adain2_morph(x_morph, z)
@@ -515,9 +681,13 @@ class Generator(nn.Module):
             x_spe = self.conv_spe2(x_spe)
             x_spa = self.conv_spa2(x_spa)
 
-            x = F.relu(self.conv1(torch.cat((x_spa,x_spe,x_morph),1)))
-            x = torch.sigmoid(self.conv2(x))
+            # Fusion
+            feat = torch.cat((x_spa,x_spe,x_morph),1)
+            x_fused = F.relu(self.conv1(feat))
+            
+            # Final generation
+            out = torch.sigmoid(self.conv2(x_fused))
 
-        return x
+        return out
 
 
