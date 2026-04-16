@@ -465,3 +465,22 @@ class SAGM_DG(Algorithm):
 
     def predict(self, x):
         return self.network(x)
+
+
+# ==============================================================================
+# 频域判别器 (用于 Dual-Path Adv 约束)
+# ==============================================================================
+class FreqDiscriminator(nn.Module):
+    def __init__(self, inchannel):
+        super(FreqDiscriminator, self).__init__()
+        self.conv1 = nn.Conv2d(inchannel, 32, kernel_size=3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+        self.fc = nn.Linear(64, 1)
+
+    def forward(self, x):
+        # 输入的是傅里叶变换的幅度谱 (B, C, H, W)
+        out = F.leaky_relu(self.conv1(x), 0.2)
+        out = F.leaky_relu(self.conv2(out), 0.2)
+        # 全局平均池化
+        out = F.adaptive_avg_pool2d(out, 1).view(out.size(0), -1)
+        return torch.sigmoid(self.fc(out))

@@ -41,132 +41,143 @@ class SpatialSpectral3DCNN(nn.Module):
         out = F.relu(self.conv2d(x_2d))
         return out
 
+
 # ==============================================================================
-# Innovation 2: FDE-Guided Class Manifold Construction (Frequency Domain Enhancement)
-# 创新点2：FDE-Guided 频域增强 (基于低频振幅的跨域风格迁移 + 相位保留)
+# 系统一：深度谱特异性解纠缠与自适应滤波 (Deep SS-DFM) —— “眼睛”
 # ==============================================================================
-class FDE_Enhancer(nn.Module):
-    def __init__(self, in_channels, h, w):
-        super(FDE_Enhancer, self).__init__()
-        self.alpha = nn.Parameter(torch.ones(1, in_channels, 1, 1) * 0.5)
+class Deep_SS_DFM(nn.Module):
+    def __init__(self, in_channels):
+        super(Deep_SS_DFM, self).__init__()
+        self.conv1d_amp = nn.Conv1d(1, 1, kernel_size=3, padding=1)
+        self.conv1d_phase = nn.Conv1d(1, 1, kernel_size=3, padding=1)
 
-    def extract_amp_phase(self, x):
-        # 2D FFT
-        fft_x = torch.fft.fft2(x, norm='ortho')
-        amp = torch.abs(fft_x)
-        phase = torch.angle(fft_x)
-        return amp, phase
-
-    def forward(self, x_src, x_tgt=None):
-        if x_tgt is not None:
-            amp_src, phase_src = self.extract_amp_phase(x_src)
-            amp_tgt, phase_tgt = self.extract_amp_phase(x_tgt)
-            
-            # Mix amplitude from target to source
-            alpha = torch.sigmoid(self.alpha)
-            mixed_amp = (1 - alpha) * amp_src + alpha * amp_tgt
-            
-            # Reconstruct with mixed amplitude and original phase
-            complex_mixed = mixed_amp * torch.exp(1j * phase_src)
-            x_out = torch.fft.ifft2(complex_mixed, norm='ortho').real
-            return x_out
-        else:
-            return x_src
-
-# Innovation 1: 3D FFT for Frequency Domain Disentanglement (filtering spectral + spatial noise)
-# 创新点1：3D FFT 频域解纠缠（过滤光谱 + 空间噪声）
-class SpectralSpatialFFT3D(nn.Module):
-    def __init__(self, h, w, c, mask_ratio=0.01):
-        super().__init__()
-        self.h = h
-        self.w = w
-        self.c = c
-        self.mask_ratio = mask_ratio
-        # Complex weight for frequency domain filtering
-        # 频域滤波的复数权重
-        self.complex_weight = nn.Parameter(torch.randn(c, h, w, 2, dtype=torch.float32) * 0.02)
+        self.complex_weight_amp = nn.Parameter(torch.randn(1, in_channels, 1, 1, dtype=torch.float32) * 0.02)
+        self.complex_weight_phase = nn.Parameter(torch.randn(1, in_channels, 1, 1, dtype=torch.float32) * 0.02)
 
     def forward(self, x):
-        # x shape: (B, C, H, W)
         B, C, H, W = x.shape
-        
-        # 3D FFT: Transform spatial (H, W) and spectral (C) dimensions
-        # 3D FFT：变换空间 (H, W) 和光谱 (C) 维度
-        # Treat C as depth. fftn over last 3 dims if input is (B, C, H, W)
-        x_fft = torch.fft.fftn(x, dim=(1, 2, 3), norm='ortho')
-        
-        # Frequency domain filtering / disentanglement
-        # 频域滤波/解纠缠
-        # Apply learnable weight
-        weight = torch.view_as_complex(self.complex_weight)
-        # Resize weight to match x_fft if needed, or assume fixed size
-        if weight.shape != x_fft.shape[1:]:
-             weight = F.interpolate(weight.unsqueeze(0), size=(C, H, W)).squeeze(0)
-             
-        x_fft = x_fft * weight.unsqueeze(0)
-        
-        # Soft thresholding or masking for noise removal (simplified)
-        # 软阈值或掩码用于去噪（简化版）
-        amp = torch.abs(x_fft)
-        threshold = torch.quantile(amp.reshape(B, -1), self.mask_ratio, dim=1, keepdim=True).reshape(B, 1, 1, 1)
-        mask = torch.where(amp > threshold, torch.ones_like(amp), torch.zeros_like(amp))
-        x_fft = x_fft * mask
-        
-        # Inverse 3D FFT
-        # 逆 3D FFT
-        x = torch.fft.ifftn(x_fft, dim=(1, 2, 3), norm='ortho').real
-        return x
+        X_freq = torch.fft.fftn(x, dim=(1, 2, 3), norm='ortho')
 
-# Innovation 2: Lightweight Attention ECA (Enhance useful features)
-# 创新点2：轻量级注意力 ECA（强化有用特征）
-class ECA(nn.Module):
-    def __init__(self, channel, k_size=3):
-        super(ECA, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # 【防御 NaN 核心 1】：绝对不能用 torch.abs，改用带 eps 的几何模长
+        A_safe = torch.sqrt(X_freq.real ** 2 + X_freq.imag ** 2 + 1e-8)
+        # 提取相位也必须加 eps 防护
+        P_safe = torch.atan2(X_freq.imag, X_freq.real + 1e-8)
 
-    def forward(self, x):
-        # x: (B, C, H, W)
-        # Global Average Pooling
-        # 全局平均池化
-        y = self.avg_pool(x)
-        
-        # 1D Convolution to capture channel interaction
-        # 1D 卷积捕获通道交互
-        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        
-        # Channel weight
-        # 通道权重
-        y = self.sigmoid(y)
-        
-        # Reweight features
-        # 重加权特征
-        return x * y.expand_as(x)
+        # 门控机制
+        A_gap = A_safe.mean(dim=(2, 3), keepdim=True).view(B, 1, C)
+        G_c_amp = torch.sigmoid(self.conv1d_amp(A_gap)).view(B, C, 1, 1)
 
+        P_gap = P_safe.mean(dim=(2, 3), keepdim=True).view(B, 1, C)
+        G_c_phase = torch.sigmoid(self.conv1d_phase(P_gap)).view(B, C, 1, 1)
+
+        W_amp = torch.view_as_complex(
+            torch.stack([self.complex_weight_amp, torch.zeros_like(self.complex_weight_amp)], dim=-1))
+        W_phase = torch.view_as_complex(
+            torch.stack([self.complex_weight_phase, torch.zeros_like(self.complex_weight_phase)], dim=-1))
+
+        X_filtered_amp = G_c_amp * (W_amp * X_freq)
+        X_filtered_phase = G_c_phase * (W_phase * X_freq)
+
+        # 【防御 NaN 核心 2】：废弃 torch.exp(1j*angle)，直接通过复数向量等比例缩放
+        mag_amp = torch.sqrt(X_filtered_amp.real ** 2 + X_filtered_amp.imag ** 2 + 1e-8)
+        A_denoised = F.relu(mag_amp - 0.01)
+        X_denoised_amp = X_filtered_amp * (A_denoised / mag_amp)
+
+        X_denoised_phase = X_filtered_phase  # 相位分支无需更改幅值
+
+        x_amp_aligned = torch.fft.ifftn(X_denoised_amp, dim=(1, 2, 3), norm='ortho').real
+        x_phase_structure = torch.fft.ifftn(X_denoised_phase, dim=(1, 2, 3), norm='ortho').real
+
+        return x_amp_aligned, x_phase_structure
+
+
+# ==============================================================================
+# 系统二：相位引导的跨域对齐增强器 (PG-FDE & PG-Attention) —— “心脏”
+# ==============================================================================
+class PG_FDE(nn.Module):
+    def __init__(self, in_channels):
+        super(PG_FDE, self).__init__()
+        self.conv1d_mask = nn.Conv1d(2, 1, kernel_size=3, padding=1)
+
+    def forward(self, x_amp_aligned, x_tgt):
+        if x_tgt is None:
+            return x_amp_aligned, x_amp_aligned
+
+        F_src = torch.fft.fftn(x_amp_aligned, dim=(1, 2, 3), norm='ortho')
+        F_tgt = torch.fft.fftn(x_tgt, dim=(1, 2, 3), norm='ortho')
+
+        # 【防御 NaN 核心 3】：同理，安全的振幅提取
+        A_src = torch.sqrt(F_src.real ** 2 + F_src.imag ** 2 + 1e-8)
+        A_tgt = torch.sqrt(F_tgt.real ** 2 + F_tgt.imag ** 2 + 1e-8)
+        B, C, H, W = A_src.shape
+
+        A_src_gap = A_src.mean(dim=(2, 3), keepdim=True).view(B, 1, C)
+        A_tgt_gap = A_tgt.mean(dim=(2, 3), keepdim=True).view(B, 1, C)
+        A_concat = torch.cat([A_src_gap, A_tgt_gap], dim=1)
+
+        M = torch.sigmoid(self.conv1d_mask(A_concat)).view(B, C, 1, 1)
+        A_mix = (1 - M) * A_src + M * A_tgt
+
+        # 【防御 NaN 核心 4】：避免提取原相位再组装，直接对原复数频谱乘上幅度缩放比例
+        x_fde = torch.fft.ifftn(F_src * (A_mix / A_src), dim=(1, 2, 3), norm='ortho').real
+        return x_fde, x_fde
+
+
+class PG_Attention(nn.Module):
+    def __init__(self, in_channels):
+        super(PG_Attention, self).__init__()
+        self.conv_attn = nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1)
+
+    def forward(self, x_phase_structure, x_fde):
+        # 计算空间梯度 (模拟 Sobel 算子) 作为几何结构先验
+        grad_x = torch.abs(x_phase_structure[:, :, :, :-1] - x_phase_structure[:, :, :, 1:])
+        grad_y = torch.abs(x_phase_structure[:, :, :-1, :] - x_phase_structure[:, :, 1:, :])
+        grad_x = F.pad(grad_x, (0, 1, 0, 0))
+        grad_y = F.pad(grad_y, (0, 0, 0, 1))
+        structure_prior = grad_x + grad_y
+
+        # 相位结构引导注意力机制
+        concat_feat = torch.cat([structure_prior, x_phase_structure], dim=1)
+        attn_map = torch.sigmoid(self.conv_attn(concat_feat))
+
+        x_att = x_phase_structure * attn_map + x_fde
+        return x_att
+
+
+# 统一整合入口
 class FeatureEnhancer(nn.Module):
     def __init__(self, imsize, imdim, n_channels=64):
         super(FeatureEnhancer, self).__init__()
+        self.deep_ss_dfm = Deep_SS_DFM(imdim)
+        self.pg_fde = PG_FDE(imdim)
+        self.pg_attention = PG_Attention(imdim)
         self.spatial_spectral = SpatialSpectral3DCNN(imdim, imdim)
-        self.fde = FDE_Enhancer(imdim, imsize[0], imsize[1])
-        self.eca = ECA(imdim)
-        
         self.beta = nn.Parameter(torch.tensor([0.5]))
 
     def forward(self, x_src, x_tgt=None):
-        # 1. 3D CNN for spatial-spectral local feature extraction
+        # 1. 眼睛 (净化与解纠缠)
+        x_amp_aligned, x_phase_structure = self.deep_ss_dfm(x_src)
+
+        # 2. 心脏 (波段自适应翻译与相位锚定)
+        x_fde, x_recon = self.pg_fde(x_amp_aligned, x_tgt)
+        x_att = self.pg_attention(x_phase_structure, x_fde)
+
+        # 3. 局部特征补充
         x_local = self.spatial_spectral(x_src)
-        
-        # 2. FDE for global amplitude alignment (if target is provided)
-        x_fde = self.fde(x_src, x_tgt)
-        
-        # 3. Channel Attention
-        x_eca = self.eca(x_fde)
-        
-        # 4. Fusion
+
+        # 4. 融合输出
         beta = torch.sigmoid(self.beta)
-        out = beta * x_local + (1 - beta) * x_eca
+        out = beta * x_local + (1 - beta) * x_att
+
+        # 增加数值截断，防止 FFT/IFFT 带来的极端数值导致判别器爆 NaN
+        out = torch.clamp(out, min=-5.0, max=5.0)
+
+        # 供系统三 (大脑) 使用的后门数据
+        if self.training:
+            return out, x_recon, x_src
         return out
+
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
